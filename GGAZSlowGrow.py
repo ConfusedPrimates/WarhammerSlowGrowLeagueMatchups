@@ -22,8 +22,8 @@ client = gspread.authorize(creds)
 # -----------------------------
 # OPEN SHEETS
 # -----------------------------
-players_sheet = client.open("Gamers Guild AZ Tempe: Warhammer The Old World League Roster").sheet1
-history_sheet = client.open("Slow Grow League Match Ups")
+players_sheet = client.open("Insert-player-sheet-name").sheet1
+history_sheet = client.open("Insert-pairings-sheet-name")
 
 # -----------------------------
 # LOAD PLAYERS
