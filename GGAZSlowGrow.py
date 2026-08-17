@@ -4,6 +4,7 @@ import random
 from itertools import combinations
 import re
 from gspread_formatting import set_data_validation_for_cell_range, DataValidationRule, BooleanCondition
+from functools import lru_cache
 
 # -----------------------------
 # AUTH
@@ -22,8 +23,9 @@ client = gspread.authorize(creds)
 # -----------------------------
 # OPEN SHEETS
 # -----------------------------
-players_sheet = client.open("Insert-player-sheet-name").sheet1
-history_sheet = client.open("Insert-pairings-sheet-name")
+players_sheet = client.open("League sign up (Responses)").sheet1
+history_sheet = client.open("League Match Ups")
+victories_sheet = client.open("victory tracker").sheet1
 
 # -----------------------------
 # LOAD PLAYERS
@@ -57,6 +59,51 @@ for sheet in history_data:
 week_sheets.sort(key=lambda x: x[0])
 
 # -----------------------------
+# LOAD PLAYER WINS
+# -----------------------------
+victory_records = victories_sheet.get_all_records()
+
+player_wins = {
+    player: 0
+    for player in players
+}
+
+# Discord username -> Full Name
+discord_to_player = {
+    discord.strip().lower(): player
+    for player, discord in player_to_discord.items()
+}
+
+
+for row in victory_records:
+    name = row["Name"].strip().lower()
+    victory_type = row["Victory type"].strip()
+
+  # Make sure the Discord username belongs to a rostered player
+    if discord not in discord_to_player:
+        print(
+            f"WARNING: Discord username '{discord}' "
+            f"was submitted but is not in the roster."
+        )
+        continue
+
+    if victory_type == "Major victory":
+        if name in player_wins:
+            player_wins[name] += 3
+    elif victory_type == "Minor victory":
+        if name in player_wins:
+            player_wins[name] += 2
+    elif victory_type == "Draw":
+        if name in player_wins:
+            player_wins[name] += 1
+    else:
+        print(
+            f"WARNING: Unknown victory type "
+            f"'{victory_type}' submitted by '{discord}'."
+        )
+
+
+# -----------------------------
 # LOAD MATCH HISTORY
 # -----------------------------
 past_matchups = set()
@@ -72,6 +119,10 @@ for week_num, sheet in week_sheets:
 # -----------------------------
 next_week = max(week_numbers) + 1 if week_numbers else 1
 
+print(
+    f"Generating Week {next_week}..."
+)
+
 # -----------------------------
 # GENERATE MATCHUPS
 # -----------------------------
@@ -83,87 +134,426 @@ if not remaining_matchups:
     print("All matchups exhausted. Resetting.")
     remaining_matchups = list(all_matchups)
 
-random.shuffle(players)
 
-pairings = []
-used_players = set()
+# ============================================================
+# CREATE VALID OPPONENT LOOKUP
+# ============================================================
 
-for p1 in players:
-    if p1 in used_players:
-        continue
+valid_opponents = {
+    player: set()
+    for player in players
+}
 
-    for p2 in players:
-        if p1 == p2 or p2 in used_players:
-            continue
+for p1, p2 in remaining_matchups:
 
-        pair = tuple(sorted([p1, p2]))
+    valid_opponents[p1].add(p2)
+    valid_opponents[p2].add(p1)
 
-        if pair in remaining_matchups:
-            pairings.append(pair)
-            used_players.add(p1)
-            used_players.add(p2)
-            break
 
-# Handle odd player
+# ============================================================
+# SKILL-BASED MATCHMAKING
+# ============================================================
+
+def calculate_matchup_cost(player1, player2):
+    """
+    The cost of a matchup is the difference
+    in number of wins.
+
+    Example:
+
+        Player A = 5 wins
+        Player B = 4 wins
+
+        Cost = 1
+
+    Lower cost = better matchup.
+    """
+
+    return abs(
+        player_wins[player1]
+        - player_wins[player2]
+    )
+
+
+def find_best_pairings(players_to_match):
+    """
+    Finds the combination of pairings that produces
+    the smallest total difference in wins.
+
+    This is better than simply matching players
+    one at a time because it considers the entire
+    round at once.
+    """
+
+    player_count = len(players_to_match)
+
+    # Map players to indexes for efficient bitmask operations
+    index_to_player = {
+        i: player
+        for i, player in enumerate(players_to_match)
+    }
+
+    player_to_index = {
+        player: i
+        for i, player in index_to_player.items()
+    }
+
+    # --------------------------------------------------------
+    # Build valid opponent masks
+    # --------------------------------------------------------
+
+    opponent_masks = [
+        0
+        for _ in range(player_count)
+    ]
+
+    for i, player in index_to_player.items():
+
+        for opponent in valid_opponents[player]:
+
+            if opponent in player_to_index:
+
+                opponent_index = player_to_index[
+                    opponent
+                ]
+
+                opponent_masks[i] |= (
+                    1 << opponent_index
+                )
+
+    # --------------------------------------------------------
+    # Recursive optimization
+    # --------------------------------------------------------
+
+    @lru_cache(maxsize=None)
+    def solve(mask):
+
+        # Everyone has been matched
+        if mask == 0:
+            return 0, ()
+
+        # Find the first unmatched player
+        first_bit = (
+            mask & -mask
+        )
+
+        first_index = (
+            first_bit.bit_length() - 1
+        )
+
+        remaining_mask = (
+            mask ^ first_bit
+        )
+
+        best_cost = float("inf")
+        best_pairings = None
+
+        # Find possible opponents
+        opponent_mask = (
+            opponent_masks[first_index]
+            & remaining_mask
+        )
+
+        while opponent_mask:
+
+            opponent_bit = (
+                opponent_mask
+                & -opponent_mask
+            )
+
+            opponent_index = (
+                opponent_bit.bit_length() - 1
+            )
+
+            opponent_mask ^= opponent_bit
+
+            # Cost of this matchup
+            cost = calculate_matchup_cost(
+                index_to_player[first_index],
+                index_to_player[opponent_index]
+            )
+
+            # Solve the rest of the round
+            remaining_after_match = (
+                remaining_mask
+                ^ opponent_bit
+            )
+
+            sub_cost, sub_pairings = solve(
+                remaining_after_match
+            )
+
+            total_cost = (
+                cost + sub_cost
+            )
+
+            if total_cost < best_cost:
+
+                best_cost = total_cost
+
+                best_pairings = (
+                    (
+                        index_to_player[first_index],
+                        index_to_player[opponent_index]
+                    ),
+                ) + sub_pairings
+
+        # No valid solution
+        if best_pairings is None:
+
+            return float("inf"), ()
+
+        return best_cost, best_pairings
+
+    # Start with every player available
+    full_mask = (
+        (1 << player_count) - 1
+    )
+
+    return solve(full_mask)
+
+
+# ============================================================
+# HANDLE ODD NUMBER OF PLAYERS
+# ============================================================
+
 bye_player = None
-if len(players) % 2 == 1:
-    for p in players:
-        if p not in used_players:
-            bye_player = p
-            break
 
-# -----------------------------
-# CREATE NEW WEEK SHEET
-# -----------------------------
-new_sheet_title = f"Week {next_week}"
-new_sheet = history_sheet.add_worksheet(title=new_sheet_title, rows="100", cols="4")
+players_for_pairing = players.copy()
 
-# Add headers
-new_sheet.append_row(["Player1", "Discord1", "Player2", "Discord2", "Result"])
+if len(players_for_pairing) % 2 == 1:
 
-# Rows
-rows = []
+    print(
+        "\nOdd number of players detected."
+    )
+
+    # --------------------------------------------------------
+    # Determine the best player to give a bye.
+    #
+    # We prefer to give the bye to a player where removing
+    # them still allows the remaining players to have valid
+    # pairings.
+    #
+    # Among those options, prefer the player with the
+    # lowest number of wins.
+    # --------------------------------------------------------
+
+    possible_byes = []
+
+    for candidate in players_for_pairing:
+
+        remaining_players = [
+            p
+            for p in players_for_pairing
+            if p != candidate
+        ]
+
+        cost, test_pairings = find_best_pairings(
+            remaining_players
+        )
+
+        if cost != float("inf"):
+
+            possible_byes.append(
+                (
+                    player_wins[candidate],
+                    candidate,
+                    cost
+                )
+            )
+
+    if not possible_byes:
+
+        raise RuntimeError(
+            "Unable to create valid pairings for "
+            "the current matchup history."
+        )
+
+    # Prefer the lowest-ranked player for the bye.
+    #
+    # If multiple players have the same number of wins,
+    # the one resulting in the best overall pairing wins.
+    possible_byes.sort(
+        key=lambda x: (
+            x[0],
+            x[2]
+        )
+    )
+
+    _, bye_player, _ = possible_byes[0]
+
+    players_for_pairing.remove(
+        bye_player
+    )
+
+    print(
+        f"Bye assigned to: "
+        f"{bye_player} "
+        f"({player_wins[bye_player]} wins)"
+    )
+
+
+# ============================================================
+# FIND OPTIMAL PAIRINGS
+# ============================================================
+
+total_cost, pairings = find_best_pairings(
+    players_for_pairing
+)
+
+
+if total_cost == float("inf"):
+
+    raise RuntimeError(
+        "Unable to create a complete set of "
+        "non-repeating matchups for this week."
+    )
+
+
+pairings = list(pairings)
+
+
+# ============================================================
+# DISPLAY GENERATED MATCHUPS
+# ============================================================
+
+print("\nGenerated Matchups:")
+print("-------------------")
+
 for p1, p2 in pairings:
-    rows.append([
+
+    win_difference = calculate_matchup_cost(
         p1,
-        player_to_discord.get(p1, ""),
-        p2,
-        player_to_discord.get(p2, ""),
-        "" # Result column
-    ])
+        p2
+    )
+
+    print(
+        f"{p1} "
+        f"({player_wins[p1]} wins) "
+        f"vs "
+        f"{p2} "
+        f"({player_wins[p2]} wins) "
+        f""
+        f"[Difference: {win_difference}]"
+    )
+
+
+print(
+    f"\nTotal matchup skill difference: "
+    f"{total_cost}"
+)
+
+
+# ============================================================
+# CREATE NEW WEEK SHEET
+# ============================================================
+
+new_sheet_title = (
+    f"Week {next_week}"
+)
+
+new_sheet = history_sheet.add_worksheet(
+    title=new_sheet_title,
+    rows="100",
+    cols="4"
+)
+
+
+# ============================================================
+# ADD HEADERS
+# ============================================================
+
+new_sheet.append_row(
+    [
+        "Player1",
+        "Discord1",
+        "Player2",
+        "Discord2"
+    ]
+)
+
+
+# ============================================================
+# ADD MATCHUP ROWS
+# ============================================================
+
+rows = []
+
+for p1, p2 in pairings:
+
+    rows.append(
+        [
+            p1,
+            player_to_discord.get(
+                p1,
+                ""
+            ),
+            p2,
+            player_to_discord.get(
+                p2,
+                ""
+            ),
+            ""
+        ]
+    )
+
 
 if rows:
-    new_sheet.append_rows(rows)
 
-# Bye row
-if bye_player:
-    new_sheet.append_row([
-        bye_player,
-        player_to_discord.get(bye_player, ""),
-        "BYE",
-        ""
-    ])
-
-# Apply dropdown per row
-for i, (p1, p2) in enumerate(pairings, start=2):  # start=2 because row 1 is header
-    
-    rule = DataValidationRule(
-        BooleanCondition(
-            'ONE_OF_LIST',
-            [p1 + ' Crushing victory',p1 +' victory', p2 + ' Crushing victory', p2 + ' victory', 'Draw']
-        ),
-        showCustomUi=True
+    new_sheet.append_rows(
+        rows
     )
-    
-    cell_range = f"E{i}"
-    set_data_validation_for_cell_range(new_sheet, cell_range, rule)
 
-# -----------------------------
-# OUTPUT
-# -----------------------------
-print(f"\nCreated {new_sheet_title}")
-for p1, p2 in pairings:
-    print(f"{p1} ({player_to_discord[p1]}) vs {p2} ({player_to_discord[p2]})")
+
+# ============================================================
+# ADD BYE
+# ============================================================
 
 if bye_player:
-    print(f"Bye: {bye_player}")
+
+    new_sheet.append_row(
+        [
+            bye_player,
+            player_to_discord.get(
+                bye_player,
+                ""
+            ),
+            "BYE",
+            "",
+            ""
+        ]
+    )
+
+
+# ============================================================
+# OUTPUT SUMMARY
+# ============================================================
+
+print(
+    f"\nCreated {new_sheet_title}"
+)
+
+print(
+    "\nFinal Matchups:"
+)
+
+for p1, p2 in pairings:
+
+    print(
+        f"{p1} "
+        f"({player_to_discord[p1]}, "
+        f"{player_wins[p1]} wins)"
+        f" vs "
+        f"{p2} "
+        f"({player_to_discord[p2]}, "
+        f"{player_wins[p2]} wins)"
+    )
+
+
+if bye_player:
+
+    print(
+        f"\nBye: "
+        f"{bye_player} "
+        f"({player_wins[bye_player]} wins)"
+    )
